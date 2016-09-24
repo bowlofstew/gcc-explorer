@@ -7,10 +7,10 @@ Notes:
 
 * storage in both hash tag and in local storage need to change. Specifically they are too tied to the notion of a single compiler.
 * should ensure backwards compatibility: store off some hash tags and test the decode to the same view in the new scheme.
+* binary mode could be done by compiling to .o (with LTO as necessary) and then decoding result of `objdump -d -C /tmp/temp.o -l -M intel --insn-width=16` (for example).
 
 
 NB
 --
 
-Killing due to time seems broken.
-Bug with clicked URLs and race to get the list of copmilers (null compiler)
+Bug with clicked URLs and race to get the list of compilers (null compiler)

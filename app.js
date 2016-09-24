@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-// Copyright (c) 2012, Matt Godbolt
+// Copyright (c) 2012-2016, Matt Godbolt
 // All rights reserved.
 // 
 // Redistribution and use in source and binary forms, with or without 
@@ -24,198 +24,95 @@
 // ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE 
 // POSSIBILITY OF SUCH DAMAGE.
 
+// load external and internal libraries (will load more internal binaries later)
 var nopt = require('nopt'),
     os = require('os'),
     props = require('./lib/properties'),
-    querystring = require('querystring'),
-    connect = require('connect'),
+    compileHandler = require('./lib/compile').compileHandler,
+    buildDiffHandler = require('./lib/diff').buildDiffHandler,
+    express = require('express'),
     child_process = require('child_process'),
-    temp = require('temp'),
     path = require('path'),
-    async = require('async'),
-    LRU = require('lru-cache'),
-    fs = require('fs-extra');
+    fs = require('fs-extra'),
+    http = require('http'),
+    https = require('https'),
+    url = require('url'),
+    Promise = require('promise');
 
+// Parse arguments from command line 'node ./app.js args...'
 var opts = nopt({
-        'env': [String],
-        'rootDir': [String]});
+    'env': [String, Array],
+    'rootDir': [String],
+    'language': [String],
+    'host': [String],
+    'port': [Number],
+    'propDebug': [Boolean]
+});
 
-var propHierarchy = [
-    'defaults', 
-    opts.env || 'dev',
-    os.hostname()];
-
+// Set default values for ommited arguments
 var rootDir = opts.rootDir || './etc';
+var language = opts.language || "C++";
+var env = opts.env || ['dev'];
+var hostname = opts.host || os.hostname();
+var port = opts.port || 10240;
 
+var propHierarchy = ['defaults'].concat(env).concat([language, os.hostname()]);
+console.log("properties hierarchy: " + propHierarchy);
+
+// Propagate debug mode if need be
+if (opts.propDebug) props.setDebug(true);
+
+// *All* files in config dir are parsed 
 props.initialize(rootDir + '/config', propHierarchy);
 
-var port = props.get('gcc-explorer', 'port', 10240);
-var compilers = [];
-var compilersByExe = {};
-var compilerExecutables;
+// Instantiate a function to access records concerning "gcc-explorer" 
+// in hidden object props.properties
+var gccProps = props.propsFor("gcc-explorer");
 
-var cache = LRU({ 
-    max: props.get('gcc-explorer', 'cacheMb') * 1024 * 1024, 
-    length: function(n) { return n.length; }
-});
-var cacheHits = 0;
-var cacheMisses = 0;
-
-var compileQueue = async.queue(function(task, callback) {
-    console.log("Compiling, queue size " + compileQueue.length());
-    task.task(callback);
-}, props.get("gcc-explorer", "maxConcurrentCompiles", 1));
-compileQueue.drain = function() {
-    console.log("Compile queue empty");
-};
-compileQueue.saturated = function() {
-    console.log("Compile queue full");
+// Read from gccexplorer's config the wdiff configuration
+// that will be used to configure lib/diff.js
+var wdiffConfig = {
+    wdiffExe: gccProps('wdiff', "wdiff"),
+    maxOutput: gccProps("max-diff-output", 100000)
 };
 
+// Instantiate a function to access records concerning the chosen language
+// in hidden object props.properties
+var compilerPropsFunc = props.propsFor(language.toLowerCase());
 
-function checkOptions(options) {
-    var okOptions = new RegExp(props.get('gcc-options', 'whitelistRe', '.*'));
-    var badOptions = new RegExp(props.get('gcc-options', 'blacklistRe'));
-    var error = [];
-    options.forEach(function(option) {
-        if (!option.match(okOptions) || option.match(badOptions)) {
-            error.push(option);
-        }
-    });
-    if (error.length > 0) return "Bad options: " + error.join(", ");
-    return null;
+// If no option for the compiler ... use gcc's options (??)
+function compilerProps(property, defaultValue) {
+    // My kingdom for ccs... [see Matt's github page]
+    var forCompiler = compilerPropsFunc(property, undefined);
+    if (forCompiler !== undefined) return forCompiler;
+    return gccProps(property, defaultValue); // gccProps comes from lib/compile.js
 }
+require('./lib/compile').initialise(gccProps, compilerProps);
+var staticMaxAgeMs = gccProps('staticMaxAgeMs', 0);
 
-function checkSource(source) {
-    var re = /^\s*#include(_next)?\s+["<"](\/|.*\.\.)/;
-    var failed = [];
-    source.split('\n').forEach(function(line, index) {
-        if (line.match(re)) {
-            failed.push("<stdin>:" + (index + 1) + ":1: no absolute or relative includes please");
-        }
-    });
-    if (failed.length > 0) return failed.join("\n");
-    return null;
-}
-
-function cacheStats() {
-    console.log("Cache stats: " + cacheHits + " hits, " + cacheMisses + " misses");
-}
-
-function compile(req, res) {
-    var source = req.body.source;
-    var compiler = req.body.compiler;
-    if (getCompilerExecutables().indexOf(compiler) < 0) {
-        return res.end(JSON.stringify({code: -1, stderr: "bad compiler " + compiler}));
-    }
-    var compilerInfo = compilersByExe[compiler];
-    if (!compilerInfo) {
-        return res.end(JSON.stringify({code: -1, stderr: "bad compiler " + compiler}));
-    }
-    var options = req.body.options.split(' ').filter(function(x){return x!=""});
-    var filters = req.body.filters;
-    var optionsErr = checkOptions(options);
-    if (optionsErr) {
-        return res.end(JSON.stringify({code: -1, stderr: optionsErr}));
-    }
-    var sourceErr = checkSource(source);
-    if (sourceErr) {
-        return res.end(JSON.stringify({code: -1, stderr: sourceErr}));
-    }
-
-    var key = compiler + " | " + source + " | " + options + " | " + filters["intel"];
-    var cached = cache.get(key);
-    if (cached) {
-        cacheHits++;
-        cacheStats();
-        res.end(cached);
-        return;
-    }
-    cacheMisses++;
-
-    var compileTask = function(taskFinished) {
-        temp.mkdir('gcc-explorer-compiler', function(err, dirPath) {
-            if (err) {
-                return res.end(JSON.stringify({code: -1, stderr: "Unable to open temp file: " + err}));
-            }
-            var postProcess = props.get("gcc-explorer", "postProcess");
-            var inputFilename = path.join(dirPath, props.get("gcc-explorer", "compileFilename"));
-            var outputFilename = path.join(dirPath, 'output.S');
-            if (compilerInfo.supportedOpts['-masm']) {
-                var syntax = '-masm=att'; // default at&t
-                if (filters["intel"] == "true") syntax = '-masm=intel';
-                options = options.concat([syntax]);
-            }
-            var compileToAsm = props.get("gcc-explorer", "compileToAsm", "-S").split(" ");
-            options = options.concat(['-g', '-o', outputFilename]).concat(compileToAsm).concat([inputFilename]);
-            var file = fs.openSync(inputFilename, "w");
-            fs.writeSync(file, source);
-            fs.closeSync(file);
-            var okToCache = true;
-            var compilerWrapper = props.get("gcc-explorer", "compiler-wrapper");
-            if (compilerWrapper) {
-                options = [compiler].concat(options);
-                compiler = compilerWrapper;
-            }
-            var child = child_process.spawn(
-                compiler,
-                options,
-                {detached: true}
-                );
-            var stdout = "";
-            var stderr = "";
-            var timeout = setTimeout(function() {
-                okToCache = false;
-                child.kill();
-                stderr += "\nKilled - processing time exceeded";
-            }, props.get("gcc-explorer", "compileTimeoutMs", 100));
-            child.stdout.on('data', function (data) { stdout += data; });
-            child.stderr.on('data', function (data) { stderr += data; });
-            child.on('exit', function (code) {
-                clearTimeout(timeout);
-                child_process.exec('cat "' + outputFilename + '" | ' + postProcess,
-                    { maxBuffer: props.get("gcc-explorer", "max-asm-size", 8 * 1024 * 1024) },
-                    function(err, filt_stdout, filt_stderr) {
-                        var data = filt_stdout;
-                        if (err) {
-                            data = '<No output: ' + err + '>';
-                        }
-
-                        var result = JSON.stringify({
-                            stdout: stdout,
-                            stderr: stderr,
-                            asm: data,
-                            code: code });
-                        if (okToCache) {
-                            cache.set(key, result);
-                            cacheStats();
-                        }
-                        res.end(result);
-                        fs.remove(dirPath);
-                        taskFinished();
-                    });
-            });
-            child.stdin.end();
-        });
-    };
-
-    compileQueue.push({task: compileTask});
-}
-
+// function to load internal binaries (i.e. lib/source/*.js)
 function loadSources() {
     var sourcesDir = "lib/sources";
     var sources = fs.readdirSync(sourcesDir)
-        .filter(function(file) { return file.match(/.*\.js$/); })
-        .map(function(file) { return require("./" + path.join(sourcesDir, file)); });
+        .filter(function (file) {
+            return file.match(/.*\.js$/);
+        })
+        .map(function (file) {
+            return require("./" + path.join(sourcesDir, file));
+        });
     return sources;
 }
 
+// load effectively
 var fileSources = loadSources();
 var sourceToHandler = {};
-fileSources.forEach(function(source) { sourceToHandler[source.urlpart] = source; });
+fileSources.forEach(function (source) {
+    sourceToHandler[source.urlpart] = source;
+});
 
+// auxiliary function used in clientOptionsHandler
 function compareOn(key) {
-    return function(xObj, yObj) {
+    return function (xObj, yObj) {
         var x = xObj[key];
         var y = yObj[key];
         if (x < y) return -1;
@@ -224,20 +121,41 @@ function compareOn(key) {
     };
 }
 
-function getSources(req, res) {
-    var sources = fileSources.map(function(source) { 
+// instantiate a function that generate javascript code,
+// this code will be embedded gcc-explorer-website/client-options.js
+function clientOptionsHandler(compilers, fileSources) {
+    var sources = fileSources.map(function (source) {
         return {name: source.name, urlpart: source.urlpart};
     });
-    res.end(JSON.stringify(sources.sort(compareOn("name"))));
+    console.log("sources: " + JSON.stringify(sources)); // debug
+    // sort source file alphabetically
+    sources = sources.sort(compareOn("name"));
+    var options = {
+        googleAnalyticsAccount: gccProps('clientGoogleAnalyticsAccount', 'UA-55180-6'),
+        googleAnalyticsEnabled: gccProps('clientGoogleAnalyticsEnabled', false),
+        sharingEnabled: gccProps('clientSharingEnabled', true),
+        githubEnabled: gccProps('clientGitHubRibbonEnabled', true),
+        urlshortener: gccProps('clientURLShortener', 'google'),
+        gapiKey: gccProps('google-api-key', 'AIzaSyAaz35KJv8DA0ABoime0fEIh32NmbyYbcQ'),
+        googleShortLinkRewrite: gccProps('googleShortLinkRewrite', '').split('|'),
+        defaultSource: gccProps('defaultSource', ''),
+        language: language,
+        compilers: compilers,
+        sourceExtension: compilerProps('compileFilename').split('.', 2)[1],
+        defaultCompiler: compilerProps('defaultCompiler', ''),
+        compileOptions: compilerProps("options"),
+        supportsBinary: !!compilerProps("supportsBinary"),
+        sources: sources
+    };
+    var text = "var OPTIONS = " + JSON.stringify(options) + ";";
+    return function getClientOptions(req, res) {
+        res.set('Content-Type', 'application/javascript');
+        res.set('Cache-Control', 'public, max-age=' + staticMaxAgeMs);
+        res.end(text);
+    };
 }
 
-function getInfo(req, res) {
-    res.end(JSON.stringify({
-        language: props.get("gcc-explorer", "language"),
-        options: props.get("gcc-explorer", "options"),
-    }));
-}
-
+// function used to enable loading and saving source code from web interface
 function getSource(req, res, next) {
     var bits = req.url.split("/");
     var handler = sourceToHandler[bits[1]];
@@ -250,30 +168,55 @@ function getSource(req, res, next) {
     else if (action == "load") action = handler.load;
     else if (action == "save") action = handler.save;
     else action = null;
-    if (action == null) {
+    if (action === null) {
         next();
         return;
     }
-    action.apply(handler, bits.slice(3).concat(function(err, response) {
+    action.apply(handler, bits.slice(3).concat(function (err, response) {
+        res.set('Cache-Control', 'public, max-age=' + staticMaxAgeMs);
         if (err) {
             res.end(JSON.stringify({err: err}));
         } else {
             res.end(JSON.stringify(response));
-        }}));
+        }
+    }));
 }
 
-function getCompilerExecutables() {
-    if (compilerExecutables) {
-        return compilerExecutables;
-    }
-    var exes = props.get("gcc-explorer", "compilers", "/usr/bin/g++").split(":");
-    var ndk = props.get('gcc-explorer', 'androidNdk');
+function retryPromise(promiseFunc, name, maxFails, retryMs) {
+    return new Promise(function (resolve, reject) {
+        var fails = 0;
+
+        function doit() {
+            var promise = promiseFunc();
+            promise.then(function (arg) {
+                resolve(arg);
+            }, function (e) {
+                fails++;
+                if (fails < maxFails) {
+                    console.log("Failed " + name + " : " + e + ", retrying");
+                    setTimeout(doit, retryMs);
+                } else {
+                    console.log("Too many retries for " + name + " : " + e);
+                    reject(e);
+                }
+            });
+        }
+
+        doit();
+    });
+}
+
+// Auxiliary function to findCompilers()
+function configuredCompilers() {
+    // read config (file already read) (':' are used to separate compilers names)
+    var exes = compilerProps("compilers", "/usr/bin/g++").split(":");
+    var ndk = compilerProps('androidNdk');
     if (ndk) {
         var toolchains = fs.readdirSync(ndk + "/toolchains");
-        toolchains.forEach(function(v, i, a) {
+        toolchains.forEach(function (v, i, a) {
             var path = ndk + "/toolchains/" + v + "/prebuilt/linux-x86_64/bin/";
             if (fs.existsSync(path)) {
-                var cc = fs.readdirSync(path).filter(function(filename) {
+                var cc = fs.readdirSync(path).filter(function (filename) {
                     return filename.indexOf("g++") != -1;
                 });
                 a[i] = path + cc[0];
@@ -281,69 +224,215 @@ function getCompilerExecutables() {
                 a[i] = null;
             }
         });
-        toolchains = toolchains.filter(function(x){return x!=null;});
+        toolchains = toolchains.filter(function (x) {
+            return x !== null;
+        });
         exes.push.apply(exes, toolchains);
     }
-    compilerExecutables = exes;
-    return exes;
+    // Map any named compilers to their executable
+    return Promise.all(exes.map(function (name) {
+        if (name.indexOf("@") !== -1) {
+            var bits = name.split("@");
+            var host = bits[0];
+            var port = parseInt(bits[1]);
+            console.log("Fetching compilers from remote source " + host + ":" + port);
+            return retryPromise(function () {
+                    return new Promise(function (resolve, reject) {
+                        http.get({
+                            hostname: host,
+                            port: port,
+                            path: "/api/compilers"
+                        }, function (res) {
+                            var str = '';
+                            res.on('data', function (chunk) {
+                                str += chunk;
+                            });
+                            res.on('end', function () {
+                                var compilers = JSON.parse(str).map(function (compiler) {
+                                    compiler.exe = null;
+                                    compiler.remote = "http://" + host + ":" + port;
+                                    return compiler;
+                                });
+                                resolve(compilers);
+                            });
+                        }).on('error', function (e) {
+                            reject(e);
+                        });
+                    });
+                },
+                host + ":" + port,
+                gccProps('proxyRetries', 20),
+                gccProps('proxyRetryMs', 500));
+        }
+        var base = "compiler." + name;
+        var exe = compilerProps(base + ".exe", "");
+        if (!exe) {
+            return Promise.resolve({id: name, exe: name, name: name});
+        }
+        function props(name, def) {
+            return compilerProps(base + "." + name, compilerProps(name, def));
+        }
+
+        return Promise.resolve({
+            id: name,
+            exe: exe,
+            name: props("name", name),
+            alias: props("alias"),
+            options: props("options"),
+            versionFlag: props("versionFlag"),
+            is6g: !!props("is6g", false),
+            intelAsm: props("intelAsm", ""),
+            needsMulti: !!props("needsMulti", true),
+            supportsBinary: !!props("supportsBinary", true)
+        });
+    }));
 }
 
-function getCompilers(req, res) {
-    res.end(JSON.stringify(compilers));
+// Auxiliary function to findCompilers()
+function getCompilerInfo(compilerInfo) {
+    if (Array.isArray(compilerInfo)) {
+        return Promise.resolve(compilerInfo);
+    }
+    return new Promise(function (resolve) {
+        var compiler = compilerInfo.exe;
+        var versionFlag = compilerInfo.versionFlag || '--version';
+        // fill field compilerInfo.version,
+        // assuming the compiler returns it's version on 1 line
+        child_process.exec(compiler + ' ' + versionFlag, function (err, output) {
+            if (err) return resolve(null);
+            compilerInfo.version = output.split('\n')[0];
+            if (compilerInfo.intelAsm) {
+                return resolve(compilerInfo);
+            }
+
+            // get informations on the compiler's options
+            child_process.exec(compiler + ' --target-help', function (err, output) {
+                var options = {};
+                if (!err) {
+                    var splitness = /--?[-a-zA-Z]+( ?[-a-zA-Z]+)/;
+                    output.split('\n').forEach(function (line) {
+                        var match = line.match(splitness);
+                        if (!match) return;
+                        options[match[0]] = true;
+                    });
+                }
+                if (options['-masm']) {
+                    compilerInfo.intelAsm = "-masm=intel";
+                }
+
+                // debug (seems to be displayed multiple times):
+                if (opts.propDebug) console.log("compiler options: " + JSON.stringify(options, null, 4));
+
+                resolve(compilerInfo);
+            });
+        });
+    });
 }
 
 function findCompilers() {
-    async.map(getCompilerExecutables(),
-        function (compiler, callback) {
-            fs.stat(compiler, function(err, result) {
-                if (err) return callback(null, null);
-                child_process.exec(compiler + ' --version', function(err, output) {
-                    if (err) return callback(null, null);
-                    var version = output.split('\n')[0];
-                    child_process.exec(compiler + ' --target-help', function(err, output) {
-                        var options = {};
-                        if (!err) {
-                            var splitness = /--?[-a-zA-Z]+( ?[-a-zA-Z]+)/;
-                            output.split('\n').forEach(function(line) {
-                                var match = line.match(splitness);
-                                if (!match) return;
-                                options[match[0]] = true;
-                            });
-                        }
-                        callback(null, {exe: compiler, version: version, supportedOpts: options});
-                    });
-                });
+    return configuredCompilers()
+        .then(function (compilers) {
+            return Promise.all(compilers.map(getCompilerInfo));
+        })
+        .then(function (compilers) {
+            compilers = Array.prototype.concat.apply([], compilers);
+            compilers = compilers.filter(function (x) {
+                return x !== null;
             });
-        },
-        function (err, all) {
-            all = all.filter(function(x){return x!=null;});
-            compilers = all.sort(function(x,y){return x.version < y.version ? -1 : x.version > y.version ? 1 : 0;});
-            compilersByExe = {};
-            compilers.forEach(function(compiler) {
-                compilersByExe[compiler.exe] = compiler;
+            compilers = compilers.sort(compareOn("name"));
+            console.log("Compilers:");
+            compilers.forEach(function (c) {
+                console.log(c.id + " : " + c.name + " : " + (c.exe || c.remote));
             });
-        }
-    );
+            return compilers;
+        });
 }
 
-findCompilers();
+// Instantiate a function that write informations on compiler,
+// in JSON format (on which page ?)
+function apiHandler(compilers) {
+    var reply = JSON.stringify(compilers);
+    return function apiHandler(req, res, next) {
+        var bits = req.url.split("/");
+        if (bits.length !== 2 || req.method !== "GET") return next();
+        switch (bits[1]) {
+            default:
+                next();
+                break;
 
-// WebServer.
-var webServer = connect();
-webServer
-    .use(connect.logger())
-    .use(connect.favicon('static/favicon.ico'))
-    .use(connect.static('static'))
-    .use(connect.bodyParser())
-    .use('/info', getInfo)
-    .use('/sources', getSources)
-    .use('/source', getSource)
-    .use('/compilers', getCompilers)
-    .use('/compile', compile);
+            case "compilers":
+                res.set('Content-Type', 'application/json');
+                res.end(reply);
+                break;
+        }
+    };
+}
 
+function shortUrlHandler(req, res, next) {
+    var bits = req.url.split("/");
+    if (bits.length !== 2 || req.method !== "GET") return next();
+    var key = process.env.GOOGLE_API_KEY;
+    var googleApiUrl = 'https://www.googleapis.com/urlshortener/v1/url?shortUrl=http://goo.gl/'
+        + encodeURIComponent(bits[1]) + '&key=' + key;
+    https.get(googleApiUrl, function (response) {
+        var responseText = '';
+        response.on('data', function (d) {
+            responseText += d;
+        });
+        response.on('end', function () {
+            if (response.statusCode != 200) {
+                console.log("Failed to resolve short URL " + bits[1] + " - got response "
+                    + response.statusCode + " : " + responseText);
+                return next();
+            }
 
-// GO!
-console.log("=======================================");
-console.log("Listening on http://" + os.hostname() + ":" + port + "/");
-console.log("=======================================");
-webServer.listen(port);
+            var resultObj = JSON.parse(responseText);
+            var parsed = url.parse(resultObj.longUrl);
+            var allowedRe = new RegExp(gccProps('allowedShortUrlHostRe'));
+            if (parsed.host.match(allowedRe) === null) {
+                console.log("Denied access to short URL " + bits[1] + " - linked to " + resultObj.longUrl);
+                return next();
+            }
+            res.writeHead(301, {
+                Location: resultObj.id,
+                'Cache-Control': 'public'
+            });
+            res.end();
+        });
+    }).on('error', function (e) {
+        res.end("TODO: error " + e.message);
+    });
+}
+
+findCompilers().then(function (compilers) {
+    var webServer = express(),
+        sFavicon = require('serve-favicon'),
+        sStatic = require('serve-static'),
+        bodyParser = require('body-parser'),
+        logger = require('morgan'),
+        compression = require('compression'),
+        restreamer = require('./lib/restreamer'),
+        diffHandler = buildDiffHandler(wdiffConfig);
+
+    webServer
+        .use(logger('combined'))
+        .use(compression())
+        .use(sFavicon('static/favicon.ico'))
+        .use(sStatic('static', {maxAge: staticMaxAgeMs}))
+        .use(bodyParser.json())
+        .use(restreamer())
+        .get('/client-options.js', clientOptionsHandler(compilers, fileSources))
+        .use('/source', getSource)
+        .use('/api', apiHandler(compilers))
+        .use('/g', shortUrlHandler)
+        .post('/compile', compileHandler(compilers)) // used inside static/compiler.js
+        .post('/diff', diffHandler); // used inside static/compiler.js
+
+    // GO!
+    console.log("=======================================");
+    console.log("Listening on http://" + hostname + ":" + port + "/");
+    console.log("=======================================");
+    webServer.listen(port, hostname);
+}).catch(function (err) {
+    console.log("Error: " + err.stack);
+});

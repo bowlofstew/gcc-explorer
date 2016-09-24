@@ -1,4 +1,4 @@
-// Copyright (c) 2012, Matt Godbolt
+// Copyright (c) 2012-2016, Matt Godbolt
 // All rights reserved.
 // 
 // Redistribution and use in source and binary forms, with or without 
@@ -28,55 +28,63 @@ var allCompilers = [];
 function getSource() {
     var source = $('.source').val();
     if (source == "browser") {
-        if (window.localStorage['files'] == undefined) window.localStorage['files'] = "{}";
+        if (window.localStorage.files === undefined) window.localStorage.files = "{}";
         return {
-            list: function(callback) {
-                var files = JSON.parse(window.localStorage['files']);
-                callback($.map(files, function(val, key) { return val; }));
+            list: function (callback) {
+                var files = JSON.parse(window.localStorage.files);
+                callback($.map(files, function (val, key) {
+                    return val;
+                }));
             },
-            load: function(name, callback) {
-                var files = JSON.parse(window.localStorage['files']);
+            load: function (name, callback) {
+                var files = JSON.parse(window.localStorage.files);
                 callback(files[name]);
             },
-            save: function(obj, callback) {
-                var files = JSON.parse(window.localStorage['files']);
+            save: function (obj, callback) {
+                var files = JSON.parse(window.localStorage.files);
                 files[obj.name] = obj;
-                window.localStorage['files'] = JSON.stringify(files);
+                window.localStorage.files = JSON.stringify(files);
                 callback(true);
             }
         };
     } else {
         var base = "/source/" + source;
         return {
-            list: function(callback) { $.getJSON(base + "/list", callback); },
-            load: function(name, callback) { $.getJSON(base + "/load/" + name, callback); },
-            save: function(obj, callback) { alert("Coming soon..."); }
+            list: function (callback) {
+                $.getJSON(base + "/list", callback);
+            },
+            load: function (name, callback) {
+                $.getJSON(base + "/load/" + name, callback);
+            },
+            save: function (obj, callback) {
+                alert("Coming soon...");
+            }
         };
     }
 }
 
 var currentFileList = {};
 function updateFileList() {
-    getSource().list(function(results) {
+    getSource().list(function (results) {
         currentFileList = {};
         $('.filename option').remove();
-        $.each(results, function(index, arg) {
+        $.each(results, function (index, arg) {
             currentFileList[arg.name] = arg;
             $('.filename').append($('<option value="' + arg.urlpart + '">' + arg.name + '</option>'));
-            if (window.localStorage['filename'] == arg.urlpart) $('.filename').val(arg.urlpart);
+            if (window.localStorage.filename == arg.urlpart) $('.filename').val(arg.urlpart);
         });
     });
 }
 
 function onSourceChange() {
     updateFileList();
-    window.localStorage['source'] = $('.source').val();
+    window.localStorage.source = $('.source').val();
 }
 
 function loadFile() {
     var name = $('.filename').val();
-    window.localStorage['filename'] = name;
-    getSource().load(name, function(results) {
+    window.localStorage.filename = name;
+    getSource().load(name, function (results) {
         if (results.file) {
             currentCompiler.setSource(results.file);
         } else {
@@ -91,16 +99,16 @@ function saveFile() {
 }
 
 function saveAs(filename) {
-    var prevFilename = window.localStorage['filename'] || "";
+    var prevFilename = window.localStorage.filename || "";
     if (filename != prevFilename && currentFileList[filename]) {
         // TODO!
         alert("Coming soon - overwriting files");
         return;
     }
-    var obj = { urlpart: filename, name: filename, file: currentCompiler.getSource() };
-    getSource().save(obj, function(ok) {
+    var obj = {urlpart: filename, name: filename, file: currentCompiler.getSource()};
+    getSource().save(obj, function (ok) {
         if (ok) {
-            window.localStorage['filename'] = filename;
+            window.localStorage.filename = filename;
             updateFileList();
         }
     });
@@ -113,157 +121,247 @@ function saveFileAs() {
     function onSave() {
         $('#saveDialog').modal('hide');
         saveAs($('#saveDialog .save-filename').val());
-    };
+    }
+
     $('#saveDialog .save').click(onSave);
-    $('#saveDialog .save-filename').keyup(function(event) {
+    $('#saveDialog .save-filename').keyup(function (event) {
         if (event.keyCode == 13) onSave();
     });
 }
 
-function loadUrlShortenerApi() {
-    gapi.client.load('urlshortener', 'v1', makePermalink);
-}
-
-function loadGoogleApisClientLibrary() {
-    $(document.body).append('<script src="https://apis.google.com/js/client.js?onload=loadUrlShortenerApi">');
-}
-
-function makePermalink() {
-    $('#permalink').val('');
-    if (!gapi.client) {
-        // Load the Google APIs client library asynchronously, then the
-        // urlshortener API, and finally come back here.
-        loadGoogleApisClientLibrary();
-        return;
-    }
-    var request = gapi.client.urlshortener.url.insert({
-        resource: {
-            longUrl: window.location.href.split('#')[0] + '#' + serialiseState(),
-        }
-    });
-    request.execute(function(response) {
-        $('#permalink').val(response.id);
-    });
-}
-
 function hidePermalink() {
-    if ($('.files .permalink').hasClass('active')) {  // do nothing if already hidden.
-        togglePermalink();
+    if ($('.files .permalink-collapse').hasClass('in')) {  // do nothing if already hidden.
+        $('.files .permalink-collapse').collapse('hide');
     }
 }
 
-function togglePermalink() {
-    if (!$('.files .permalink').hasClass('active')) {
-        $('.files .permalink').addClass('active');
+function showPermalink(short) {
+    if (!$('.files .permalink-collapse').hasClass('in')) {
         $('.files .permalink-collapse').collapse('show');
-        makePermalink();
+    }
+    $('#permalink').val('');
+
+    var fullUrl = window.location.href.split('#')[0] + '#' + serialiseState();
+    if (short) {
+        shortenURL(fullUrl,
+            function (shortUrl) {
+                $('#permalink').val(shortUrl);
+            });
     } else {
-        $('.files .permalink-collapse').collapse('hide');
-        $('.files .permalink').removeClass('active');
+        $('#permalink').val(fullUrl);
     }
 }
 
 function serialiseState() {
-    var state = {
-        version: 3,
-        filterAsm: getAsmFilters(),
-        compilers: $.map(allCompilers, function(compiler) { return compiler.serialiseState(); })
-    };
-    return encodeURIComponent(JSON.stringify(state));
+    var compressed = rison.quote(rison.encode_object(getState(true)));
+    var uncompressed = rison.quote(rison.encode_object(getState(false)));
+    var MinimalSavings = 0.20;  // at least this ratio smaller
+    if (compressed.length < uncompressed.length * (1.0 - MinimalSavings)) {
+        return compressed;
+    } else {
+        return uncompressed;
+    }
 }
 
-function deserialiseState(state) {
+function getState(compress) {
+    return {
+        version: 3,
+        filterAsm: getAsmFilters(),
+        compilers: $.map(allCompilers, function (compiler) {
+            return compiler.serialiseState(compress);
+        })
+    };
+}
+
+// Gist is a pastbin service operated by github
+function toGist(state) {
+    files = {};
+    function nameFor(compiler) {
+        var addNum = 0;
+        var name, add;
+        for (; ;) {
+            add = addNum ? addNum.toString() : "";
+            name = compiler + add + '.' + OPTIONS.sourceExtension;
+            if (files[name] === undefined) return name;
+            addNum++;
+        }
+    };
+    state.compilers.forEach(function (s) {
+        var name = nameFor(s.compiler);
+        files[name] = {
+            content: s.source,
+            language: OPTIONS.language
+        };
+        s.source = name;
+    });
+    files['state.json'] = {content: JSON.stringify(state)};
+    return JSON.stringify({
+        description: "Compiler Explorer automatically generated files",
+        'public': false,
+        files: files
+    });
+}
+
+function isGithubLimitError(request) {
+    var remaining = parseInt(request.getResponseHeader('X-RateLimit-Remaining'));
+    var reset = parseInt(request.getResponseHeader('X-RateLimit-Reset'));
+    var limit = parseInt(request.getResponseHeader('X-RateLimit-Limit'));
+    if (remaining !== 0) return null;
+    var left = (new Date(reset * 1000) - Date.now()) / 1000;
+    return "Rate limit of " + limit + " exceeded: " + Math.round(left / 60) + " mins til reset";
+}
+
+function makeGist(onDone, onFail) {
+    var req = $.ajax('https://api.github.com/gists', {
+        type: 'POST',
+        accepts: 'application/vnd.github.v3+json',
+        dataType: 'json',
+        contentType: 'application/json',
+        data: toGist(getState())
+    });
+    req.done(function (msg) {
+        onDone(msg);
+    });
+    req.fail(function (jqXHR, textStatus) {
+        var rateLimited = isGithubLimitError(jqXHR);
+        if (rateLimited)
+            onFail(rateLimited);
+        else
+            onFail(textStatus + " (" + jqXHR.statusText + ")");
+    });
+}
+
+function fromGist(msg) {
+    var state = JSON.parse(msg.files['state.json'].content);
+    state.compilers.forEach(function (s) {
+        s.source = msg.files[s.source].content;
+    });
+    return state;
+}
+function loadGist(gist) {
+    var req = $.ajax('https://api.github.com/gists/' + gist);
+    req.done(function (msg) {
+        loadState(fromGist(msg));
+    });
+    req.fail(function (jqXHR, textStatus) {
+        var err = isGithubLimitError(jqXHR);
+        if (!err) {
+            err = textStatus + " (" + jqXHR.statusText + ")";
+        }
+        alert("Unable to load gist: " + err);
+    });
+}
+
+function deserialiseState(stateText) {
+    var state = null;
+    if (stateText.substr(0, 2) == "g=") {
+        loadGist(stateText.substr(2));
+        return;
+    }
+
     try {
-        state = $.parseJSON(decodeURIComponent(state));
-        switch (state.version) {
+        state = rison.decode_object(decodeURIComponent(stateText.replace(/\+/g, '%20')));
+    } catch (ignored) {
+    }
+
+    if (!state) {
+        try {
+            state = $.parseJSON(decodeURIComponent(stateText));
+        } catch (ignored) {
+        }
+    }
+    if (state) {
+        return loadState(state);
+    }
+    return false;
+}
+
+function loadState(state) {
+    if (!state || state['version'] === undefined) return false;
+    switch (state.version) {
         case 1:
             state.filterAsm = {};
-            // falls into
+        /* falls through */
         case 2:
             state.compilers = [state];
-            // falls into
+        /* falls through */
         case 3:
             break;
         default:
             return false;
-        }
-    } catch (ignored) { return false; }
+    }
     setFilterUi(state.filterAsm);
     for (var i = 0; i < Math.min(allCompilers.length, state.compilers.length); i++) {
-        allCompilers[i].deserialiseState(state.compilers[i]);
+        allCompilers[i].setFilters(state.filterAsm);
+        allCompilers[i].deserialiseState(state.compilers[i],OPTIONS.compilers, OPTIONS.defaultCompiler);
     }
     return true;
 }
 
-function initialise() {
+function resizeEditors() {
+    var windowHeight = $(window).height();
+    _.each(allCompilers, function (compiler) { compiler.resize(windowHeight); });
+}
+
+function initialise(options) {
     var defaultFilters = JSON.stringify(getAsmFilters());
-    var actualFilters = $.parseJSON(window.localStorage['filter'] || defaultFilters);
+    var actualFilters = $.parseJSON(window.localStorage.filter || defaultFilters);
     setFilterUi(actualFilters);
 
-    // Synchronous request here to make the whole race condition problem of
-    // getting language and compiler options after we've set local overrides.
-    var languageType = "text/x-c++src";
-    $.ajax({
-        url: "/info",
-        dataType: "json",
-        async: false,
-        success: function(results) {
-            $(".language-name").text(results.language);
-            if (results.language == "Rust") {
-                languageType = "text/x-rustsrc";
-            } else if (results.language == "D") {
-                languageType = "text/x-d";
-            }
-            $(".compiler_options").val(results.options);
-        }
-    }); // must be ahead of the compiler creation. This is all terrible.
+    $(".compiler-options").val(options.compileoptions);
+    $(".language-name").text(options.language);
 
-    var compiler = new Compiler($('body'), actualFilters, "a", function() {
+    var compiler = new Compiler($('body'), actualFilters, "a", function () {
         hidePermalink();
-    }, languageType);
+    }, options.language, options.compilers, options.defaultCompiler);
     allCompilers.push(compiler);
     currentCompiler = compiler;
 
-    $('form').submit(function() { return false; });
-    $('.files .source').change(onSourceChange);
-    $.getJSON("/compilers", function(results) {
-        compilersByExe = {};
-        $.each(results, function(index, arg) {
-            compilersByExe[arg.exe] = arg;
-        });
-        compiler.setCompilers(results);
+    $('form').submit(function () {
+        return false;
     });
-    $.getJSON("/sources", function(results) {
+    $('.files .source').change(onSourceChange);
+    // This initialization is moved inside var compiler = new Compiler ....
+    // compiler.setCompilers(options.compilers, options.defaultCompiler);
+    function setSources(sources, defaultSource) {
         $('.source option').remove();
-        $.each(results, function(index, arg) {
+        $.each(sources, function (index, arg) {
             $('.files .source').append($('<option value="' + arg.urlpart + '">' + arg.name + '</option>'));
-            if (window.localStorage['source'] == arg.urlpart) {
+            if (defaultSource == arg.urlpart) {
                 $('.files .source').val(arg.urlpart);
             }
         });
         onSourceChange();
-    });
-    $('.files .load').click(function() {
+    }
+
+    setSources(options.sources, window.localStorage.source || options.defaultSource);
+    $('.files .load').click(function () {
         loadFile();
         return false;
     });
-    $('.files .save').click(function() {
+    $('.files .save').click(function () {
         saveFile();
         return false;
     });
-    $('.files .saveas').click(function() {
+    $('.files .saveas').click(function () {
         saveFileAs();
         return false;
     });
-    $('.files .permalink').click(function(e) {
-        togglePermalink(e);
+    $('.files .fulllink').click(function (e) {
+        showPermalink(false);
         return false;
     });
-    
-    $('.filter button.btn').click(function(e) {
+    $('.files .shortlink').click(function (e) {
+        showPermalink(true);
+        return false;
+    });
+
+    new Clipboard('.btn.clippy');
+
+    $('.filter button.btn').click(function (e) {
         $(e.target).toggleClass('active');
         var filters = getAsmFilters();
-        window.localStorage['filter'] = JSON.stringify(filters);
+        window.localStorage.filter = JSON.stringify(filters);
         currentCompiler.setFilters(filters);
     });
 
@@ -271,37 +369,77 @@ function initialise() {
         deserialiseState(window.location.hash.substr(1));
     }
 
-    $(window).bind('hashchange', function() {
+    $(window).bind('hashchange', function () {
         loadFromHash();
     });
     loadFromHash();
 
-    function resizeEditors() {
-        var codeMirrors = $('.CodeMirror');
-        var top = codeMirrors.position().top;
-        var windowHeight = $(window).height();
-        var compOutputSize = Math.max(100, windowHeight * 0.05);
-        $('.output').height(compOutputSize);
-        var resultHeight = $('.result').height();
-        var height = windowHeight - top - resultHeight - 40;
-        currentCompiler.setEditorHeight(height);
-    }
     $(window).on("resize", resizeEditors);
     resizeEditors();
 }
 
 function getAsmFilters() {
     var asmFilters = {};
-    $('.filter button.btn.active').each(function() {
+    $('.filter button.btn.active').each(function () {
         asmFilters[$(this).val()] = true;
     });
     return asmFilters;
 }
 
 function setFilterUi(asmFilters) {
-    $('.filter button.btn').each(function() {
+    $('.filter button.btn').each(function () {
         $(this).toggleClass('active', !!asmFilters[$(this).val()]);
     });
 }
 
-$(initialise);
+$(document).ready(function() {
+    $('#new-slot').on('click', function(e)  {
+        console.log("[UI] User clicked on new-slot button.");
+        var newSlot = currentCompiler.createAndPlaceSlot(
+            OPTIONS.compilers, OPTIONS.defaultCompiler, null, true);
+        resizeEditors();
+        currentCompiler.refreshSlot(newSlot);
+    });
+});
+
+$(document).ready(function() {
+    $('#new-diff').on('click', function(e)  {
+        console.log("[UI] User clicked on new-diff button.");
+        var newDiff = currentCompiler.createAndPlaceDiffUI(null, true);
+        resizeEditors();
+    });
+});
+
+$(function () {
+    initialise(OPTIONS);
+});
+
+////////////////////////////////////////////////////////////////////////////////
+// Unit/Functional tests require:
+
+function getSettingsList() {
+    // console.log(JSON.stringify(window.localStorage));
+    var entries = Object.getOwnPropertyNames(window.localStorage);
+    return entries;
+}
+
+function getSetting(settingName) {
+    return window.localStorage[settingName];
+}
+
+function wipeSettings() {
+    window.localStorage.clear();
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// DEBUG :
+function listSettings() {
+    var entries = getSettingsList();
+    for (var i = 0; i < entries.length; i++) {
+        console.log(entries[i]);
+    }
+}
+
+function showSetting(settingName) {
+    console.log(JSON.stringify(getSetting(settingName, null, ' ')));
+}

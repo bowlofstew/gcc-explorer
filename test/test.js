@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-// Copyright (c) 2012, Matt Godbolt
+// Copyright (c) 2012-2016, Matt Godbolt
 // All rights reserved.
 // 
 // Redistribution and use in source and binary forms, with or without 
@@ -25,7 +25,7 @@
 // POSSIBILITY OF SUCH DAMAGE.
 
 var fs = require('fs');
-var asm = require('../static/asm.js');
+var asm = require('../lib/asm.js');
 
 function processAsm(filename, filters) {
     var file = fs.readFileSync(filename, 'utf-8');
@@ -33,8 +33,12 @@ function processAsm(filename, filters) {
 }
 
 var cases = fs.readdirSync('./cases')
-    .filter(function(x){return x.match(/\.asm$/)})
-    .map(function(x){return './cases/' + x;});
+    .filter(function (x) {
+        return x.match(/\.asm$/)
+    })
+    .map(function (x) {
+        return './cases/' + x;
+    });
 
 var failures = 0;
 
@@ -45,28 +49,45 @@ function assertEq(a, b, context) {
     }
 }
 
-function testFilter(filename, suffix, filters) {
+function testFilter(filename, suffix, filters, withSource) {
     var result = processAsm(filename, filters);
     var expected = filename + suffix;
     try {
         var file = fs.readFileSync(expected, 'utf-8').split('\n');
     } catch (e) {
+        console.log("Skipping non-existent test case " + expected);
         return;
     }
     assertEq(file.length, result.length, expected);
     if (file.length != result.length) return;
     for (var i = 0; i < file.length; ++i) {
-        assertEq(file[i], result[i].text, expected + ":" + (i+1));
+        var lineExpected = result[i].text;
+        if (withSource && result[i].source) {
+            lineExpected += " @ " + result[i].source;
+        }
+        assertEq(file[i], lineExpected, expected + ":" + (i + 1));
     }
 }
 
+cases.forEach(function (x) {
+    testFilter(x, "", {})
+});
+cases.forEach(function (x) {
+    testFilter(x, ".directives", {directives: true})
+});
+cases.forEach(function (x) {
+    testFilter(x, ".directives.labels",
+        {directives: true, labels: true})
+});
+cases.forEach(function (x) {
+    testFilter(x, ".directives.labels.comments",
+        {directives: true, labels: true, commentOnly: true})
+});
 
-cases.forEach(function(x){ testFilter(x, "", {}) });
-cases.forEach(function(x){ testFilter(x, ".directives", { directives: true}) });
-cases.forEach(function(x){ testFilter(x, ".directives.labels",
-            { directives: true, labels: true}) });
-cases.forEach(function(x){ testFilter(x, ".directives.labels.comments", 
-            { directives: true, labels: true, commentOnly: true }) });
+cases.forEach(function (x) {
+    testFilter(x, ".dlc.source",
+        {directives: true, labels: true, commentOnly: true}, true)
+});
 
 if (failures) {
     console.log(failures + " failures");
